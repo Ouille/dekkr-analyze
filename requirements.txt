@@ -1,0 +1,5 @@
+essentia
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
