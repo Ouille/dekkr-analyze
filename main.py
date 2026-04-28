@@ -6,6 +6,7 @@ Licence : AGPL-3.0
 import os
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 
 from analysis import analyze_audio
@@ -18,6 +19,13 @@ app = FastAPI(
     description="Service d'analyse audio (tonalité, BPM, structure) via Essentia",
     version="1.0.0",
     license_info={"name": "AGPL-3.0"},
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 security = HTTPBearer()
