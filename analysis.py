@@ -73,14 +73,14 @@ def detect_cue_points(audio, bpm, duration: float) -> list:
     HOP_SIZE = 512
 
     # ── Extraction MFCC + RMS par frame ───────────────────────────────────────
-    frame_cutter = es.FrameCutter(frameSize=FRAME_SIZE, hopSize=HOP_SIZE, startFromZero=True)
+    # FrameGenerator est l'API standard Essentia pour itérer sur des frames
     windowing    = es.Windowing(type='hann')
     spectrum_alg = es.Spectrum()
     mfcc_alg     = es.MFCC(numberCoefficients=13)
     rms_alg      = es.RMS()
 
     mfcc_frames, rms_frames = [], []
-    for frame in frame_cutter(audio):
+    for frame in es.FrameGenerator(audio, frameSize=FRAME_SIZE, hopSize=HOP_SIZE, startFromZero=True):
         spec = spectrum_alg(windowing(frame))
         _, coeffs = mfcc_alg(spec)
         mfcc_frames.append(coeffs)
