@@ -1,38 +1,40 @@
 """
-Logique d'analyse audio via Essentia.
+Analyse audio via Essentia — tonalité, BPM, structure.
 """
 
-import essentia.standard as es
 import numpy as np
+import essentia.standard as es
 from camelot import to_camelot
 
-ANALYSIS_VERSION = 1
-
-# Seuil de confiance minimum pour retourner une tonalité (vs "?")
+ANALYSIS_VERSION = 2
 KEY_CONFIDENCE_THRESHOLD = 0.5
+
+# ── Constantes structure ───────────────────────────────────────────────────────
+MIN_DIST_SEC       = 16     # distance minimale entre deux cue points
+NOVELTY_THRESHOLD  = 0.25   # seuil de détection (0–1)
+MFCC_WINDOW_SEC    = 3      # fenêtre de comparaison MFCC (secondes de chaque côté)
+ENERGY_WINDOW_SEC  = 4      # fenêtre de mesure énergie avant/après
+BUILDUP_WINDOW_SEC = 12     # fenêtre de détection buildup
+DROP_RATIO         = 1.35
+BREAK_RATIO        = 0.65
 
 
 def analyze_audio(filepath: str) -> dict:
-    # Chargement mono 44100 Hz
     loader = es.MonoLoader(filename=filepath, sampleRate=44100)
     audio = loader()
     duration = len(audio) / 44100.0
 
-    # ── Tonalité ──────────────────────────────────────────────
+    # ── Tonalité ──────────────────────────────────────────────────────────────
     key_extractor = es.KeyExtractor()
     key, scale, key_strength = key_extractor(audio)
+    camelot_key = to_camelot(key, scale) if key_strength >= KEY_CONFIDENCE_THRESHOLD else "?"
 
-    if key_strength >= KEY_CONFIDENCE_THRESHOLD:
-        camelot_key = to_camelot(key, scale)
-    else:
-        camelot_key = "?"
-
-    # ── BPM ───────────────────────────────────────────────────
+    # ── BPM ───────────────────────────────────────────────────────────────────
     rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
-    bpm, beats, bpm_confidence, _, beats_intervals = rhythm_extractor(audio)
+    bpm, beats, bpm_confidence, _, _ = rhythm_extractor(audio)
 
-    # ── Cue points (segmentation structurelle) ────────────────
-    cue_points = detect_cue_points(audio, beats, bpm, duration)
+    # ── Structure (MFCC Essentia) ─────────────────────────────────────────────
+    cue_points = detect_cue_points(audio, bpm, duration)
 
     return {
         "key": camelot_key,
@@ -45,82 +47,138 @@ def analyze_audio(filepath: str) -> dict:
     }
 
 
-def detect_cue_points(audio, beats, bpm, duration: float) -> list:
-    """
-    Détection de structure par analyse de l'énergie RMS par segment.
-    Identifie les transitions significatives (drops, breaks, intros, outros).
-    """
-    if bpm <= 0 or len(beats) < 4:
+def gaussian_smooth(arr, sigma):
+    """Lissage gaussien sans scipy."""
+    half = int(round(sigma * 3))
+    kernel = np.array([np.exp(-k**2 / (2 * sigma**2)) for k in range(-half, half + 1)])
+    kernel /= kernel.sum()
+    n = len(arr)
+    result = np.zeros(n)
+    for t in range(n):
+        acc = 0.0
+        for ki, w in enumerate(kernel):
+            idx = t + ki - half
+            idx = max(0, min(n - 1, idx))
+            acc += w * arr[idx]
+        result[t] = acc
+    return result
+
+
+def detect_cue_points(audio, bpm, duration: float) -> list:
+    if duration < 20 or bpm <= 0:
         return []
 
-    # Découper l'audio en segments d'une mesure (4 beats)
-    samples_per_beat = int(44100 * 60 / bpm)
-    samples_per_bar = samples_per_beat * 4
-    n_bars = max(1, len(audio) // samples_per_bar)
+    SAMPLE_RATE = 44100
+    FRAME_SIZE = 2048
+    HOP_SIZE = 512
 
-    # Énergie RMS par mesure
-    rms_per_bar = []
-    for i in range(n_bars):
-        start = i * samples_per_bar
-        end = min(start + samples_per_bar, len(audio))
-        segment = audio[start:end]
-        rms = float(np.sqrt(np.mean(segment ** 2))) if len(segment) > 0 else 0.0
-        rms_per_bar.append(rms)
+    # ── Extraction MFCC + RMS par frame ───────────────────────────────────────
+    frame_cutter = es.FrameCutter(frameSize=FRAME_SIZE, hopSize=HOP_SIZE, startFromZero=True)
+    windowing    = es.Windowing(type='hann')
+    spectrum_alg = es.Spectrum()
+    mfcc_alg     = es.MFCC(numberCoefficients=13)
+    rms_alg      = es.RMS()
 
-    if not rms_per_bar:
+    mfcc_frames, rms_frames = [], []
+    for frame in frame_cutter(audio):
+        spec = spectrum_alg(windowing(frame))
+        _, coeffs = mfcc_alg(spec)
+        mfcc_frames.append(coeffs)
+        rms_frames.append(float(rms_alg(frame)))
+
+    if not mfcc_frames:
         return []
 
-    rms_array = np.array(rms_per_bar)
-    mean_rms = np.mean(rms_array)
-    std_rms = np.std(rms_array)
+    # ── Agrégation par seconde ────────────────────────────────────────────────
+    frames_per_sec = max(1, SAMPLE_RATE // HOP_SIZE)
+    n_secs = int(duration)
+
+    mfcc_secs, rms_secs = [], []
+    for s in range(n_secs):
+        start = s * frames_per_sec
+        end = min(start + frames_per_sec, len(mfcc_frames))
+        if start >= len(mfcc_frames):
+            break
+        mfcc_secs.append(np.mean(mfcc_frames[start:end], axis=0))
+        rms_secs.append(float(np.mean(rms_frames[start:end])))
+
+    n = len(mfcc_secs)
+    if n < 8:
+        return []
+
+    mfcc_matrix = np.array(mfcc_secs)
+    rms_array   = np.array(rms_secs)
+
+    # Normaliser MFCC (cosine similarity)
+    norms = np.linalg.norm(mfcc_matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    mfcc_norm = mfcc_matrix / norms
+
+    # ── Courbe de nouveauté par distance MFCC entre sections adjacentes ───────
+    w = min(MFCC_WINDOW_SEC, n // 4)
+    novelty = np.zeros(n)
+    for t in range(w, n - w):
+        before = np.mean(mfcc_norm[t - w:t], axis=0)
+        after  = np.mean(mfcc_norm[t:t + w], axis=0)
+        novelty[t] = float(np.linalg.norm(after - before))
+
+    novelty_smooth = gaussian_smooth(novelty, sigma=3)
+    max_n = novelty_smooth.max()
+    if max_n > 0:
+        novelty_smooth /= max_n
+
+    # ── Détection de pics ─────────────────────────────────────────────────────
+    min_dist = max(1, int(MIN_DIST_SEC))
+    candidates = []
+    last = -min_dist
+
+    for t in range(1, n - 1):
+        if (novelty_smooth[t] > novelty_smooth[t - 1] and
+            novelty_smooth[t] > novelty_smooth[t + 1] and
+            novelty_smooth[t] > NOVELTY_THRESHOLD and
+            t - last >= min_dist):
+            candidates.append(t)
+            last = t
+
+    # ── Classification ────────────────────────────────────────────────────────
+    mean_rms = float(rms_array.mean())
+    ew = max(1, int(ENERGY_WINDOW_SEC))
+    bw = max(1, int(BUILDUP_WINDOW_SEC))
+
+    def mean_range(arr, a, b):
+        a, b = max(0, int(a)), min(len(arr), int(b))
+        return float(arr[a:b].mean()) if a < b else 0.0
 
     cue_points = []
+    for ci, t in enumerate(candidates):
+        pos = float(t)
+        rel = pos / n
 
-    for i in range(1, n_bars - 1):
-        delta = rms_array[i] - rms_array[i - 1]
-        position = i * samples_per_bar / 44100.0
+        e_before = mean_range(rms_array, t - ew, t)
+        e_after  = mean_range(rms_array, t, t + ew)
+        conf     = round(float(novelty_smooth[t]), 3)
 
-        # Intro : début du track avec énergie croissante
-        if i <= max(2, int(n_bars * 0.10)) and rms_array[i] < mean_rms * 0.6:
-            if not any(c["type"] == "intro" for c in cue_points):
-                cue_points.append({
-                    "position": round(position, 2),
-                    "type": "intro",
-                    "confidence": round(0.7 + min(0.25, (mean_rms - rms_array[i]) / (mean_rms + 1e-6) * 0.5), 3),
-                })
+        if rel < 0.15 and e_before < mean_rms * 0.6:
+            ctype = "intro"
+        elif rel > 0.82 and e_after < e_before * 0.75:
+            ctype = "outro"
+        elif e_after > e_before * DROP_RATIO:
+            ctype = "drop"
+        elif e_after < e_before * BREAK_RATIO:
+            ctype = "break"
+        else:
+            e_earlier = mean_range(rms_array, t - bw, t - ew)
+            ctype = "buildup" if e_earlier < e_before * 0.75 and e_after >= e_before * 0.9 else "drop"
 
-        # Drop : montée significative d'énergie
-        elif delta > std_rms * 1.2 and rms_array[i] > mean_rms:
-            cue_points.append({
-                "position": round(position, 2),
-                "type": "drop",
-                "confidence": round(min(0.99, 0.65 + delta / (std_rms * 3)), 3),
-            })
+        next_pos = float(candidates[ci + 1]) if ci < len(candidates) - 1 else float(n)
 
-        # Break : chute significative d'énergie
-        elif delta < -std_rms * 1.2 and rms_array[i] < mean_rms:
-            cue_points.append({
-                "position": round(position, 2),
-                "type": "break",
-                "confidence": round(min(0.99, 0.65 + abs(delta) / (std_rms * 3)), 3),
-            })
+        cue_points.append({
+            "position":      round(pos, 2),
+            "type":          ctype,
+            "confidence":    conf,
+            "duration":      round(next_pos - pos, 2),
+            "energyBefore":  round(e_before, 6),
+            "energyAfter":   round(e_after, 6),
+        })
 
-        # Outro : fin du track avec énergie décroissante
-        elif i >= int(n_bars * 0.85) and rms_array[i] < mean_rms * 0.6:
-            if not any(c["type"] == "outro" for c in cue_points):
-                cue_points.append({
-                    "position": round(position, 2),
-                    "type": "outro",
-                    "confidence": round(0.7 + min(0.25, (mean_rms - rms_array[i]) / (mean_rms + 1e-6) * 0.5), 3),
-                })
-
-    # Déduplique : min 8 secondes entre deux cue points
-    cue_points.sort(key=lambda c: c["position"])
-    filtered = []
-    last_pos = -999.0
-    for cp in cue_points:
-        if cp["position"] - last_pos >= 8.0:
-            filtered.append(cp)
-            last_pos = cp["position"]
-
-    return filtered
+    return cue_points
