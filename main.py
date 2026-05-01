@@ -4,6 +4,8 @@ Licence : AGPL-3.0
 """
 
 import os
+import numpy as np
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,11 +16,28 @@ from analysis import analyze_audio
 API_KEY = os.environ.get("API_KEY", "")
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 Mo
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Pré-charger les algorithmes Essentia au démarrage pour éviter
+    # que la première vraie requête soit lente et retourne un 502 timeout.
+    try:
+        import essentia.standard as es
+        dummy = np.random.randn(44100).astype(np.float32) * 0.01
+        es.KeyExtractor()(dummy)
+        es.RhythmExtractor2013(method="multifeature")(dummy)
+        print("[startup] Essentia warmup OK")
+    except Exception as e:
+        print(f"[startup] Essentia warmup skip: {e}")
+    yield
+
+
 app = FastAPI(
     title="DekkR Analyze",
     description="Service d'analyse audio (tonalité, BPM, structure) via Essentia",
     version="1.0.0",
     license_info={"name": "AGPL-3.0"},
+    lifespan=lifespan,
 )
 
 app.add_middleware(

@@ -36,9 +36,13 @@ def analyze_audio(filepath: str) -> dict:
     duration = len(audio) / 44100.0
 
     # ── Tonalité ──────────────────────────────────────────────────────────────
-    # profileType "edma" est plus fiable que le défaut pour la musique électronique
-    key_extractor = es.KeyExtractor(profileType="edma")
-    key, scale, key_strength = key_extractor(audio)
+    # profileType "edma" est plus fiable pour l'électro — fallback sur défaut si indisponible
+    try:
+        key_extractor = es.KeyExtractor(profileType="edma")
+        key, scale, key_strength = key_extractor(audio)
+    except Exception:
+        key_extractor = es.KeyExtractor()
+        key, scale, key_strength = key_extractor(audio)
     camelot_key = to_camelot(key, scale) if key_strength >= KEY_CONFIDENCE_THRESHOLD else "?"
 
     # ── BPM (algorithme principal : multifeature) ─────────────────────────────
