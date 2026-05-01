@@ -1,5 +1,6 @@
 """
 Analyse audio via Essentia — tonalité, BPM, structure, loudness.
+Optimisé mémoire : 22050 Hz, streaming MFCC, troncature 15 min.
 """
 
 import numpy as np
@@ -7,6 +8,8 @@ import essentia.standard as es
 from camelot import to_camelot
 
 ANALYSIS_VERSION = 3
+SAMPLE_RATE = 22050          # 44100 → 22050 : divise par 2 l'empreinte mémoire
+MAX_DURATION_SEC = 15 * 60   # troncature de sécurité pour les très longs tracks
 KEY_CONFIDENCE_THRESHOLD = 0.5
 
 # ── Constantes structure ───────────────────────────────────────────────────────
@@ -17,11 +20,10 @@ ENERGY_WINDOW_SEC  = 4
 BUILDUP_WINDOW_SEC = 12
 DROP_RATIO         = 1.35
 BREAK_RATIO        = 0.65
-BEAT_SNAP_SEC      = 0.25  # snap au beat le plus proche si < 250ms d'écart
+BEAT_SNAP_SEC      = 0.25
 
 
 def _snap_to_beat(pos_sec: float, beats: np.ndarray) -> float:
-    """Retourne la position du beat le plus proche si dans la fenêtre BEAT_SNAP_SEC."""
     if len(beats) == 0:
         return pos_sec
     idx = int(np.argmin(np.abs(beats - pos_sec)))
@@ -31,34 +33,32 @@ def _snap_to_beat(pos_sec: float, beats: np.ndarray) -> float:
 
 
 def analyze_audio(filepath: str) -> dict:
-    loader = es.MonoLoader(filename=filepath, sampleRate=44100)
+    loader = es.MonoLoader(filename=filepath, sampleRate=SAMPLE_RATE)
     audio = loader()
-    duration = len(audio) / 44100.0
+    duration = len(audio) / float(SAMPLE_RATE)
+
+    # Troncature de sécurité
+    if duration > MAX_DURATION_SEC:
+        audio = audio[:int(MAX_DURATION_SEC * SAMPLE_RATE)]
+        duration = float(MAX_DURATION_SEC)
 
     # ── Tonalité ──────────────────────────────────────────────────────────────
-    # profileType "edma" est plus fiable pour l'électro — fallback sur défaut si indisponible
     try:
-        key_extractor = es.KeyExtractor(profileType="edma")
-        key, scale, key_strength = key_extractor(audio)
+        key, scale, key_strength = es.KeyExtractor(
+            profileType="edma", sampleRate=SAMPLE_RATE
+        )(audio)
     except Exception:
-        key_extractor = es.KeyExtractor()
-        key, scale, key_strength = key_extractor(audio)
+        key, scale, key_strength = es.KeyExtractor(sampleRate=SAMPLE_RATE)(audio)
     camelot_key = to_camelot(key, scale) if key_strength >= KEY_CONFIDENCE_THRESHOLD else "?"
 
-    # ── BPM (algorithme principal : multifeature) ─────────────────────────────
-    rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
-    bpm, beats, bpm_confidence, beats_confidence, bpm_estimates = rhythm_extractor(audio)
+    # ── BPM + beats ───────────────────────────────────────────────────────────
+    bpm, beats, bpm_confidence, _, _ = es.RhythmExtractor2013(
+        method="multifeature", sampleRate=SAMPLE_RATE
+    )(audio)
     beats_arr = np.array(beats, dtype=np.float32)
 
-    # BPM secondaire (Percival) — consensus entre deux algorithmes indépendants
-    bpm_percival: float | None = None
-    try:
-        bpm_percival = round(float(es.PercivalBpmEstimator()(audio)), 2)
-    except Exception:
-        pass
-
-    # ── Loudness RMS intégrée ─────────────────────────────────────────────────
-    loudness_rms_db: float | None = None
+    # ── Loudness RMS ──────────────────────────────────────────────────────────
+    loudness_rms_db = None
     try:
         rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
         if rms > 1e-10:
@@ -66,35 +66,28 @@ def analyze_audio(filepath: str) -> dict:
     except Exception:
         pass
 
-    # ── Danceability (0–3, plus élevé = plus dansant) ─────────────────────────
-    danceability: float | None = None
+    # ── Danceability ──────────────────────────────────────────────────────────
+    danceability = None
     try:
-        d, _ = es.Danceability()(audio)
+        d, _ = es.Danceability(sampleRate=SAMPLE_RATE)(audio)
         danceability = round(float(d), 3)
     except Exception:
         pass
 
-    # ── Structure (MFCC + RMS + snap beats) ──────────────────────────────────
+    # ── Structure ─────────────────────────────────────────────────────────────
     cue_points = detect_cue_points(audio, bpm, duration, beats_arr)
 
     return {
-        # Tonalité
         "key":             camelot_key,
         "key_raw":         key,
         "key_scale":       scale,
         "key_confidence":  round(float(key_strength), 3),
-        # BPM
         "bpm":             round(float(bpm), 2),
         "bpm_confidence":  round(float(bpm_confidence), 3),
-        "bpm_percival":    bpm_percival,
         "beats":           [round(float(b), 3) for b in beats_arr],
-        # Loudness / énergie
         "loudness_rms_db": loudness_rms_db,
-        # Danceability
         "danceability":    danceability,
-        # Structure
         "cue_points":      cue_points,
-        # Meta
         "duration":        round(duration, 2),
         "analysis_version": ANALYSIS_VERSION,
     }
@@ -119,43 +112,54 @@ def detect_cue_points(audio, bpm, duration: float, beats_arr: np.ndarray) -> lis
     if duration < 20 or bpm <= 0:
         return []
 
-    SAMPLE_RATE = 44100
-    FRAME_SIZE  = 2048
-    HOP_SIZE    = 512
+    FRAME_SIZE = 2048
+    HOP_SIZE   = 512
 
     windowing    = es.Windowing(type='hann')
     spectrum_alg = es.Spectrum()
     mfcc_alg     = es.MFCC(numberCoefficients=13)
     rms_alg      = es.RMS()
 
-    mfcc_frames, rms_frames = [], []
-    for frame in es.FrameGenerator(audio, frameSize=FRAME_SIZE, hopSize=HOP_SIZE, startFromZero=True):
-        spec = spectrum_alg(windowing(frame))
-        _, coeffs = mfcc_alg(spec)
-        mfcc_frames.append(coeffs)
-        rms_frames.append(float(rms_alg(frame)))
-
-    if not mfcc_frames:
-        return []
-
+    # Streaming : agrégation par seconde — évite de stocker ~23K frames en mémoire
     frames_per_sec = max(1, SAMPLE_RATE // HOP_SIZE)
     n_secs = int(duration)
 
-    mfcc_secs, rms_secs = [], []
-    for s in range(n_secs):
-        start = s * frames_per_sec
-        end   = min(start + frames_per_sec, len(mfcc_frames))
-        if start >= len(mfcc_frames):
-            break
-        mfcc_secs.append(np.mean(mfcc_frames[start:end], axis=0))
-        rms_secs.append(float(np.mean(rms_frames[start:end])))
+    mfcc_secs: list[np.ndarray] = []
+    rms_secs: list[float] = []
+    mfcc_acc  = np.zeros(13, dtype=np.float64)
+    rms_acc   = 0.0
+    count     = 0
+    cur_sec   = 0
+
+    for frame_idx, frame in enumerate(
+        es.FrameGenerator(audio, frameSize=FRAME_SIZE, hopSize=HOP_SIZE, startFromZero=True)
+    ):
+        sec = frame_idx // frames_per_sec
+        if sec != cur_sec:
+            if count > 0 and cur_sec < n_secs:
+                mfcc_secs.append((mfcc_acc / count).astype(np.float32))
+                rms_secs.append(rms_acc / count)
+            mfcc_acc[:] = 0.0
+            rms_acc = 0.0
+            count = 0
+            cur_sec = sec
+
+        spec = spectrum_alg(windowing(frame))
+        _, coeffs = mfcc_alg(spec)
+        mfcc_acc += coeffs
+        rms_acc  += float(rms_alg(frame))
+        count    += 1
+
+    if count > 0 and cur_sec < n_secs:
+        mfcc_secs.append((mfcc_acc / count).astype(np.float32))
+        rms_secs.append(rms_acc / count)
 
     n = len(mfcc_secs)
     if n < 8:
         return []
 
-    mfcc_matrix = np.array(mfcc_secs)
-    rms_array   = np.array(rms_secs)
+    mfcc_matrix = np.array(mfcc_secs, dtype=np.float32)
+    rms_array   = np.array(rms_secs,  dtype=np.float32)
 
     norms = np.linalg.norm(mfcc_matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1
@@ -176,7 +180,6 @@ def detect_cue_points(audio, bpm, duration: float, beats_arr: np.ndarray) -> lis
     min_dist = max(1, int(MIN_DIST_SEC))
     candidates = []
     last = -min_dist
-
     for t in range(1, n - 1):
         if (novelty_smooth[t] > novelty_smooth[t - 1] and
             novelty_smooth[t] > novelty_smooth[t + 1] and
@@ -218,14 +221,14 @@ def detect_cue_points(audio, bpm, duration: float, beats_arr: np.ndarray) -> lis
         next_pos = float(candidates[ci + 1]) if ci < len(candidates) - 1 else float(n)
 
         cue_points.append({
-            "position":      pos_snap,
-            "position_raw":  round(pos_sec, 2),
-            "snapped":       pos_snap != pos_sec,
-            "type":          ctype,
-            "confidence":    conf,
-            "duration":      round(next_pos - pos_sec, 2),
-            "energyBefore":  round(e_before, 6),
-            "energyAfter":   round(e_after, 6),
+            "position":     pos_snap,
+            "position_raw": round(pos_sec, 2),
+            "snapped":      pos_snap != pos_sec,
+            "type":         ctype,
+            "confidence":   conf,
+            "duration":     round(next_pos - pos_sec, 2),
+            "energyBefore": round(e_before, 6),
+            "energyAfter":  round(e_after, 6),
         })
 
     return cue_points

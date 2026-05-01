@@ -23,9 +23,9 @@ async def lifespan(app: FastAPI):
     # que la première vraie requête soit lente et retourne un 502 timeout.
     try:
         import essentia.standard as es
-        dummy = np.random.randn(44100).astype(np.float32) * 0.01
-        es.KeyExtractor()(dummy)
-        es.RhythmExtractor2013(method="multifeature")(dummy)
+        dummy = np.random.randn(22050).astype(np.float32) * 0.01
+        es.KeyExtractor(sampleRate=22050)(dummy)
+        es.RhythmExtractor2013(method="multifeature", sampleRate=22050)(dummy)
         print("[startup] Essentia warmup OK")
     except Exception as e:
         print(f"[startup] Essentia warmup skip: {e}")
