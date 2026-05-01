@@ -2,4 +2,4 @@ essentia==2.1b6.dev1034
 fastapi
 uvicorn[standard]
 python-multipart
-numpy
+numpy<2.0
