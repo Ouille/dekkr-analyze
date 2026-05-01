@@ -61,11 +61,8 @@ def analyze_audio(filepath: str) -> dict:
         )(audio)
     except Exception:
         ratio = SAMPLE_RATE / 44100.0
-        # Fourchette corrigée pour le sampleRate virtuel 44100 Hz
-        min_t = int(round(90 / ratio))
-        max_t = int(round(180 / ratio))
         bpm_raw, beats_raw, bpm_confidence, _, _ = es.RhythmExtractor2013(
-            method="multifeature", minTempo=min_t, maxTempo=max_t
+            method="multifeature"
         )(audio)
         bpm   = float(bpm_raw) * ratio
         beats = [float(b) / ratio for b in beats_raw]
