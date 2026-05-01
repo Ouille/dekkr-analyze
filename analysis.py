@@ -56,16 +56,36 @@ def analyze_audio(filepath: str) -> dict:
     # On passe la correction manuellement : algo suppose 44100 Hz, audio est à SAMPLE_RATE.
     try:
         bpm, beats, bpm_confidence, _, _ = es.RhythmExtractor2013(
-            method="multifeature", sampleRate=SAMPLE_RATE
+            method="multifeature", sampleRate=SAMPLE_RATE,
+            minTempo=90, maxTempo=180
         )(audio)
     except Exception:
-        bpm_raw, beats_raw, bpm_confidence, _, _ = es.RhythmExtractor2013(
-            method="multifeature"
-        )(audio)
         ratio = SAMPLE_RATE / 44100.0
+        # Fourchette corrigée pour le sampleRate virtuel 44100 Hz
+        min_t = int(round(90 / ratio))
+        max_t = int(round(180 / ratio))
+        bpm_raw, beats_raw, bpm_confidence, _, _ = es.RhythmExtractor2013(
+            method="multifeature", minTempo=min_t, maxTempo=max_t
+        )(audio)
         bpm   = float(bpm_raw) * ratio
         beats = [float(b) / ratio for b in beats_raw]
     beats_arr = np.array(beats, dtype=np.float32)
+
+    # Filet de sécurité : si le BPM sort quand même de la fourchette, on corrige
+    # et on interpole les beats manquants (cas half-time résiduel).
+    while float(bpm) < 90 and float(bpm) > 0:
+        bpm = float(bpm) * 2
+        if len(beats_arr) > 1:
+            half_intervals = np.diff(beats_arr) / 2
+            new_beats = []
+            for i in range(len(beats_arr) - 1):
+                new_beats.append(beats_arr[i])
+                new_beats.append(beats_arr[i] + half_intervals[i])
+            new_beats.append(beats_arr[-1])
+            beats_arr = np.array(new_beats, dtype=np.float32)
+    while float(bpm) > 180:
+        bpm = float(bpm) / 2
+        beats_arr = beats_arr[::2]  # garder 1 beat sur 2
 
     # ── Loudness RMS ──────────────────────────────────────────────────────────
     loudness_rms_db = None
