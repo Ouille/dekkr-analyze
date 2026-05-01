@@ -1,4 +1,4 @@
-essentia
+essentia==2.1b6.dev1093
 fastapi
 uvicorn[standard]
 python-multipart

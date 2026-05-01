@@ -52,9 +52,19 @@ def analyze_audio(filepath: str) -> dict:
     camelot_key = to_camelot(key, scale) if key_strength >= KEY_CONFIDENCE_THRESHOLD else "?"
 
     # ── BPM + beats ───────────────────────────────────────────────────────────
-    bpm, beats, bpm_confidence, _, _ = es.RhythmExtractor2013(
-        method="multifeature", sampleRate=SAMPLE_RATE
-    )(audio)
+    # RhythmExtractor2013 n'accepte plus sampleRate depuis essentia >2.1b6.dev1093.
+    # On passe la correction manuellement : algo suppose 44100 Hz, audio est à SAMPLE_RATE.
+    try:
+        bpm, beats, bpm_confidence, _, _ = es.RhythmExtractor2013(
+            method="multifeature", sampleRate=SAMPLE_RATE
+        )(audio)
+    except Exception:
+        bpm_raw, beats_raw, bpm_confidence, _, _ = es.RhythmExtractor2013(
+            method="multifeature"
+        )(audio)
+        ratio = SAMPLE_RATE / 44100.0
+        bpm   = float(bpm_raw) * ratio
+        beats = [float(b) / ratio for b in beats_raw]
     beats_arr = np.array(beats, dtype=np.float32)
 
     # ── Loudness RMS ──────────────────────────────────────────────────────────
